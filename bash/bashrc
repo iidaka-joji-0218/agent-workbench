@@ -1,0 +1,333 @@
+# managed-by: ai-agent-dotfiles
+# Windows / macOS / Linux 共通。WezTerm の default_prog は bash -i。
+
+__dotfiles_unix() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$p"
+    return
+  fi
+  p="${p//\\//}"
+  if [[ "$p" =~ ^([A-Za-z]):/(.*)$ ]]; then
+    echo "/${BASH_REMATCH[1],,}/${BASH_REMATCH[2]}"
+  else
+    echo "$p"
+  fi
+}
+
+__dotfiles_is_windows() {
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+: "${HOME:=$(__dotfiles_unix "${USERPROFILE:-$HOME}")}"
+LOCALAPPDATA_UNIX=""
+if [[ -n "${LOCALAPPDATA:-}" ]]; then
+  LOCALAPPDATA_UNIX="$(__dotfiles_unix "$LOCALAPPDATA")"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/.local/opt/nvim/bin:$HOME/Apps/oh-my-posh:$PATH"
+[[ -d "$HOME/.local/opt/nvim-win64/bin" ]] && export PATH="$HOME/.local/opt/nvim-win64/bin:$PATH"
+[[ -x "$HOME/.local/opt/node/node.exe" || -d "$HOME/.local/opt/node" ]] && export PATH="$HOME/.local/opt/node:$PATH"
+[[ -d "$HOME/.local/opt/node/bin" ]] && export PATH="$HOME/.local/opt/node/bin:$PATH"
+[[ -d "$HOME/Apps/WezTerm" ]] && export PATH="$HOME/Apps/WezTerm:$PATH"
+[[ -d "$HOME/Applications/WezTerm.app/Contents/MacOS" ]] && export PATH="$HOME/Applications/WezTerm.app/Contents/MacOS:$PATH"
+[[ -d "/Applications/WezTerm.app/Contents/MacOS" ]] && export PATH="/Applications/WezTerm.app/Contents/MacOS:$PATH"
+[[ -d "$HOME/.tfenv/bin" ]] && export PATH="$PATH:$HOME/.tfenv/bin"
+
+# lazygit の e は OS のプロセスとして EDITOR を起動する。
+# Windows では Git Bash の `nvim` より .exe を指す。
+if [[ -x "$HOME/.local/opt/nvim-win64/bin/nvim.exe" ]]; then
+  export EDITOR="$HOME/.local/opt/nvim-win64/bin/nvim.exe"
+elif [[ -x "$HOME/.local/opt/nvim/bin/nvim" ]]; then
+  export EDITOR="$HOME/.local/opt/nvim/bin/nvim"
+elif command -v nvim >/dev/null 2>&1; then
+  export EDITOR="$(command -v nvim)"
+fi
+[[ -n "${EDITOR:-}" ]] && export VISUAL="$EDITOR" GIT_EDITOR="$EDITOR"
+
+# AI agent 起動（WezTerm は常に `agent` を打つ。実体は ~/.wezterm-agent.conf）
+# 切替: agent-use claude
+# cursor のときだけ会話ファイル監視でペイン題名を付ける。
+
+__AGENT_CONF="$HOME/.wezterm-agent.conf"
+__agent_provider="cursor"
+__agent_custom_cmd=""
+
+__agent_load_conf() {
+  __agent_provider="cursor"
+  __agent_custom_cmd=""
+  [[ -f "$__AGENT_CONF" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    val="${val#\"}"
+    val="${val%\"}"
+    val="${val#\'}"
+    val="${val%\'}"
+    case "$key" in
+      provider) __agent_provider="$val" ;;
+      command) __agent_custom_cmd="$val" ;;
+    esac
+  done <"$__AGENT_CONF"
+}
+
+__resolve_cursor_agent() {
+  local name="${1:-agent}"
+  if [[ -n "$LOCALAPPDATA_UNIX" && -f "$LOCALAPPDATA_UNIX/cursor-agent/${name}.cmd" ]]; then
+    echo "$LOCALAPPDATA_UNIX/cursor-agent/${name}.cmd"
+    return
+  fi
+  if [[ -x "$HOME/.local/bin/$name" ]]; then
+    echo "$HOME/.local/bin/$name"
+    return
+  fi
+  type -P "$name" 2>/dev/null || true
+}
+
+__agent_bin_for() {
+  local provider="$1"
+  case "$provider" in
+    cursor) __resolve_cursor_agent agent ;;
+    claude) type -P claude 2>/dev/null || true ;;
+    gemini) type -P gemini 2>/dev/null || true ;;
+    copilot) type -P copilot 2>/dev/null || true ;;
+    codex) type -P codex 2>/dev/null || true ;;
+    custom) printf '%s' "$__agent_custom_cmd" ;;
+    *) printf '' ;;
+  esac
+}
+
+# 会話を横取り・分岐させる引数が来たら ID の指定は足さない。
+__cursor_wants_own_chat() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --resume | --continue | -c | -p | --print | -h | --help | -v | --version) return 1 ;;
+      resume | ls | login | logout | mcp | plugin | worker | status | whoami) return 1 ;;
+      models | bedrock | about | update | create-chat | generate-rule | rule | help) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+__cursor_agent_run() {
+  local launcher="$1"
+  shift
+
+  local watcher="$HOME/.cursor/hooks/wezterm-title-watch.js"
+  local has_node=""
+  command -v node >/dev/null 2>&1 && has_node=1
+
+  if [[ -z "$WEZTERM_PANE" || -z "$has_node" || ! -f "$watcher" ]]; then
+    "$launcher" "$@"
+    return $?
+  fi
+
+  local dir="$HOME/.cursor/pane-titles"
+  mkdir -p "$dir" 2>/dev/null
+  printf '未着手\n' >"$dir/$WEZTERM_PANE.txt"
+
+  local chat_id=""
+  if __cursor_wants_own_chat "$@"; then
+    chat_id=$(node -e 'process.stdout.write(require("crypto").randomUUID())' 2>/dev/null)
+  fi
+
+  local watch_pid=""
+  if [[ -n "$chat_id" ]]; then
+    node "$watcher" "$WEZTERM_PANE" "$chat_id" >/dev/null 2>&1 &
+    watch_pid=$!
+    disown "$watch_pid" 2>/dev/null
+    "$launcher" --resume "$chat_id" "$@"
+  else
+    "$launcher" "$@"
+  fi
+  local rc=$?
+
+  [[ -n "$watch_pid" ]] && kill "$watch_pid" 2>/dev/null
+  rm -f "$dir/$WEZTERM_PANE.txt" 2>/dev/null
+  return $rc
+}
+
+__agent_run_cmd() {
+  local cmd="$1"
+  shift
+  if [[ -z "$cmd" ]]; then
+    echo "AI agent（$__agent_provider）のコマンドが見つかりません。agent-use と ./bootstrap.sh --agent $__agent_provider を確認してください。" >&2
+    return 127
+  fi
+  if [[ "$cmd" == *' '* ]]; then
+    eval "$cmd \"\$@\""
+  else
+    "$cmd" "$@"
+  fi
+}
+
+agent() {
+  __agent_load_conf
+  local bin
+  bin="$(__agent_bin_for "$__agent_provider")"
+  if [[ -z "$bin" ]]; then
+    echo "AI agent（$__agent_provider）のコマンドが見つかりません。agent-use と ./bootstrap.sh --agent $__agent_provider を確認してください。" >&2
+    return 127
+  fi
+  if [[ "$__agent_provider" == cursor ]]; then
+    __cursor_agent_run "$bin" "$@"
+    return $?
+  fi
+  if [[ -n "$WEZTERM_PANE" ]]; then
+    title "$__agent_provider"
+  fi
+  __agent_run_cmd "$bin" "$@"
+}
+
+cursor-agent() {
+  local bin
+  bin="$(__resolve_cursor_agent cursor-agent)"
+  [[ -z "$bin" ]] && bin="$(__resolve_cursor_agent agent)"
+  if [[ -z "$bin" ]]; then
+    echo "cursor-agent が見つかりません。" >&2
+    return 127
+  fi
+  __cursor_agent_run "$bin" "$@"
+}
+
+agent-use() {
+  local name="${1:-}"
+  local extra="${2:-}"
+  __agent_load_conf
+  if [[ -z "$name" || "$name" == -h || "$name" == --help ]]; then
+    echo "現在: $__agent_provider"
+    [[ -n "$__agent_custom_cmd" ]] && echo "command: $__agent_custom_cmd"
+    echo "使い方: agent-use cursor|claude|gemini|copilot|codex"
+    echo "        agent-use custom '起動コマンド'"
+    return 0
+  fi
+  case "$name" in
+    cursor | claude | gemini | copilot | codex) extra="" ;;
+    custom)
+      if [[ -z "$extra" ]]; then
+        echo "custom はコマンドが必要です。例: agent-use custom 'npx my-agent'" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "未対応: $name （cursor / claude / gemini / copilot / codex / custom）" >&2
+      return 1
+      ;;
+  esac
+  mkdir -p "$(dirname "$__AGENT_CONF")" 2>/dev/null
+  {
+    echo "# managed-by: ai-agent-dotfiles"
+    echo "provider=$name"
+    [[ -n "$extra" ]] && echo "command=$extra"
+  } >"$__AGENT_CONF"
+  __agent_load_conf
+  echo "AI agent を $name にしました。新しいペインの agent から使います。"
+}
+
+# ペインタイトル設定（WezTerm の user var 経由。タブバー右端の一覧に反映される）
+# 使い方: title fix-sg
+export PANE_TITLE=""
+__b64() {
+  if printf '%s' x | base64 -w0 >/dev/null 2>&1; then
+    printf '%s' "$1" | base64 -w0
+  else
+    printf '%s' "$1" | base64 | tr -d '\n'
+  fi
+}
+title() {
+  export PANE_TITLE="$*"
+  printf '\033]1337;SetUserVar=PANE_TITLE=%s\007' "$(__b64 "$PANE_TITLE")"
+}
+
+# oh-my-posh（Windows はポータブル exe。WindowsApps エイリアスは使わない）
+# init 出力はキャッシュする。本体やテーマを更新すると自動で作り直す。
+__omp_bin=""
+__omp_theme="$HOME/.config/oh-my-posh/light.omp.json"
+for __omp_c in \
+  "$HOME/Apps/oh-my-posh/oh-my-posh.exe" \
+  "$HOME/.local/bin/oh-my-posh" \
+  "$HOME/Apps/oh-my-posh/oh-my-posh"
+do
+  if [[ -x "$__omp_c" ]]; then
+    __omp_bin="$__omp_c"
+    break
+  fi
+done
+if [[ -z "$__omp_bin" ]] && command -v oh-my-posh >/dev/null 2>&1; then
+  __omp_c="$(command -v oh-my-posh)"
+  if [[ "$__omp_c" != *WindowsApps* ]]; then
+    __omp_bin="$__omp_c"
+  fi
+fi
+if [[ -n "$__omp_bin" && ! -f "$__omp_theme" && -f "$(dirname "$__omp_bin")/light.omp.json" ]]; then
+  __omp_theme="$(dirname "$__omp_bin")/light.omp.json"
+fi
+__omp_cache="$HOME/.cache/oh-my-posh/init.bash"
+if [[ -x "$__omp_bin" ]]; then
+  if [[ ! -s "$__omp_cache" || "$__omp_bin" -nt "$__omp_cache" || "$__omp_theme" -nt "$__omp_cache" ]]; then
+    mkdir -p "$(dirname "$__omp_cache")"
+    "$__omp_bin" init bash --print --config "$__omp_theme" >"$__omp_cache" 2>/dev/null
+  fi
+  [[ -s "$__omp_cache" ]] && source "$__omp_cache"
+fi
+unset __omp_bin __omp_theme __omp_cache __omp_c
+
+# WezTerm へ cwd を通知する（OSC 7）。
+# Git Bash は既定で送らないため、分割した新ペインが常に default_cwd で開いてしまう。
+# 送っておくと wezterm.lua 側の pane:get_current_working_dir() が使えるようになる。
+# パスは cd したときだけ組み立てる。
+__osc7_last=""
+__osc7() {
+  [[ "$PWD" == "$__osc7_last" ]] && return
+  __osc7_last="$PWD"
+
+  local dir out='' i c n host
+  if __dotfiles_is_windows; then
+    dir=$(pwd -W 2>/dev/null || pwd)
+    host=""
+  else
+    dir=$PWD
+    host="${HOSTNAME:-}"
+  fi
+
+  # マルチバイトを1バイトずつ percent-encode するためロケールを落とす
+  local LC_ALL=C
+  for ((i = 0; i < ${#dir}; i++)); do
+    c=${dir:i:1}
+    case "$c" in
+      [-_.~/:a-zA-Z0-9]) out+=$c ;;
+      *)
+        printf -v n '%d' "'$c"
+        ((n < 0)) && n=$((n + 256))
+        printf -v c '%%%02X' "$n"
+        out+=$c
+        ;;
+    esac
+  done
+
+  if __dotfiles_is_windows; then
+    printf '\033]7;file:///%s\033\\' "${out#/}"
+  else
+    printf '\033]7;file://%s%s\033\\' "$host" "$out"
+  fi
+}
+PROMPT_COMMAND="__osc7${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
+if command -v locale >/dev/null 2>&1 && locale -a 2>/dev/null | grep -qiE '^ja_JP\.(utf-8|UTF-8)$'; then
+  export LANG=ja_JP.UTF-8
+  export LC_ALL=ja_JP.UTF-8
+elif [[ -z "${LANG:-}" || "$LANG" == "C" ]]; then
+  export LANG=C.UTF-8
+fi

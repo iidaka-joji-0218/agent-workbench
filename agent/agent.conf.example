@@ -1,0 +1,9 @@
+# WezTerm 右ペインで起動する AI agent（1つ選ぶ）
+# 切替: シェルで  agent-use claude
+#        またはこのファイルの provider= を書き換えて新しいタブを開く
+#
+# 値: cursor | claude | gemini | copilot | codex | custom
+provider=cursor
+#
+# custom のときだけ起動コマンド（スペース可）
+# command=npx my-agent

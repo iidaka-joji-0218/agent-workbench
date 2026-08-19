@@ -1,0 +1,12 @@
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.bak
+*.bak.*
+wezterm/wezterm-dirs.txt
+.env
+.env.*
+*.exe
+*.zip
+node_modules/
