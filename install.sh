@@ -193,6 +193,29 @@ install_file "$ROOT/nvim/lazy-lock.json" "$NVIM_DIR/lazy-lock.json"
 echo "==> Cursor hook"
 install_file "$ROOT/cursor/hooks/wezterm-title-watch.js" "$HOME/.cursor/hooks/wezterm-title-watch.js"
 
+echo "==> Claude hook"
+install_file "$ROOT/claude/hooks/update-pane-title.sh" "$HOME/.claude/scripts/update-pane-title.sh"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  chmod +x "$HOME/.claude/scripts/update-pane-title.sh"
+fi
+if [[ "$AGENT" == "claude" ]]; then
+  CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    install_file "$ROOT/claude/settings.hooks.json.example" "$CLAUDE_SETTINGS"
+  elif ! command -v jq >/dev/null 2>&1; then
+    echo "  --  jq が無いため $CLAUDE_SETTINGS への UserPromptSubmit フック追加をスキップ（手動で hooks.UserPromptSubmit に update-pane-title.sh を登録してください）"
+  elif jq -e '.hooks.UserPromptSubmit and (.hooks.UserPromptSubmit | length > 0)' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
+    echo "keep: $CLAUDE_SETTINGS （既存の UserPromptSubmit フックがあるため変更しない）"
+  else
+    echo "install: $CLAUDE_SETTINGS に WezTerm タイトル用の UserPromptSubmit フックを追加"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      backup "$CLAUDE_SETTINGS"
+      MERGED="$(jq '.hooks.UserPromptSubmit = [{"hooks":[{"type":"command","command":"~/.claude/scripts/update-pane-title.sh"}]}]' "$CLAUDE_SETTINGS")"
+      printf '%s\n' "$MERGED" >"$CLAUDE_SETTINGS"
+    fi
+  fi
+fi
+
 echo "==> AI agent"
 AGENT_CONF="$HOME/.wezterm-agent.conf"
 if [[ -n "$AGENT" ]]; then

@@ -621,17 +621,23 @@ local function truncate(text, limit)
   return text:sub(1, cut - 1) .. '…'
 end
 
--- ペインのラベルを取得: Cursor hook が書いたタイトルを優先し、
+-- ペインのラベルを取得: Cursor / Claude Code の hook が書いたタイトルを優先し、
 -- 手動 title コマンド、OSC タイトルの順でフォールバックする
 local function pane_label(p)
   local label = nil
   local ok_id, pane_id = pcall(function() return p:pane_id() end)
   if ok_id and pane_id then
-    local path = wezterm.home_dir .. '/.cursor/pane-titles/' .. tostring(pane_id) .. '.txt'
-    local file = io.open(path, 'r')
-    if file then
-      label = file:read('*l')
-      file:close()
+    for _, sub in ipairs({ '.cursor/pane-titles/', '.claude/pane-titles/' }) do
+      local path = wezterm.home_dir .. '/' .. sub .. tostring(pane_id) .. '.txt'
+      local file = io.open(path, 'r')
+      if file then
+        local l = file:read('*l')
+        file:close()
+        if l and l ~= '' then
+          label = l
+          break
+        end
+      end
     end
   end
   if not label or label == '' then
